@@ -1,0 +1,195 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-monitoring-config
+  namespace: security
+data:
+  falco.yaml: |
+    rules_file:
+      - /etc/falco/falco_rules.yaml
+      - /etc/falco/falco_rules.local.yaml
+      - /etc/falco/k8s_audit_rules.yaml
+
+    program_output:
+      enabled: true
+      keep_alive: false
+      program: "jq '{text: .output}' | curl -d @- -X POST https://hooks.slack.com/services/YOUR-WEBHOOK-URL"
+
+    http_output:
+      enabled: true
+      url: "http://alert-manager:9093/api/v1/alerts"
+
+    file_output:
+      enabled: true
+      filename: /var/log/falco-events.log
+
+    syslog_output:
+      enabled: true
+
+    stdout_output:
+      enabled: true
+
+    time_format_iso_8601: true
+
+    json_output: true
+
+    log_level: info
+
+    priority: debug
+
+    buffered_outputs: false
+
+    syscall_event_drops:
+      threshold: 0.1
+      actions:
+        - log
+        - alert
+
+    syscall_event_timeouts:
+      max_timeout: 2000
+
+    watch_config_files: true
+
+  falco_rules.local.yaml: |
+    - rule: Terminal shell in container
+      desc: A shell was used as the entrypoint/exec point into a container with an attached terminal.
+      condition: >
+        spawned_process and container
+        and shell_procs and proc.tty != 0
+        and container_entrypoint
+      output: >
+        A shell was spawned in a container with an attached terminal (user=%user.name %container.info
+        shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline terminal=%proc.tty container_id=%container.id)
+      priority: NOTICE
+      tags: [container, shell, mitre_execution]
+
+    - rule: Run shell in container
+      desc: A shell was spawned by a non-shell program in a container.
+      condition: >
+        spawned_process and container
+        and shell_procs and proc.tty = 0
+        and container_entrypoint
+        and not proc.pname in (shell_binaries)
+      output: >
+        Shell spawned in a container by non-shell program (user=%user.name %container.info
+        shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline container_id=%container.id)
+      priority: NOTICE
+      tags: [container, shell, mitre_execution]
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: security
+  labels:
+    app: falco
+    role: security
+spec:
+  selector:
+    matchLabels:
+      app: falco
+  template:
+    metadata:
+      labels:
+        app: falco
+        role: security
+    spec:
+      containers:
+        - name: falco
+          image: falcosecurity/falco:latest
+          securityContext:
+            privileged: true
+          args: [ "/usr/bin/falco", "-K", "/var/run/secrets/kubernetes.io/serviceaccount/token", "-k", "https://kubernetes.default.svc.cluster.local", "-pk" ]
+          volumeMounts:
+            - mountPath: /var/run/docker.sock
+              name: docker-socket
+            - mountPath: /host/dev
+              name: dev-fs
+            - mountPath: /host/proc
+              name: proc-fs
+              readOnly: true
+            - mountPath: /host/boot
+              name: boot-fs
+              readOnly: true
+            - mountPath: /host/lib/modules
+              name: lib-modules
+              readOnly: true
+            - mountPath: /host/usr
+              name: usr-fs
+              readOnly: true
+            - mountPath: /etc/falco
+              name: config-volume
+      volumes:
+        - name: docker-socket
+          hostPath:
+            path: /var/run/docker.sock
+        - name: dev-fs
+          hostPath:
+            path: /dev
+        - name: proc-fs
+          hostPath:
+            path: /proc
+        - name: boot-fs
+          hostPath:
+            path: /boot
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: usr-fs
+          hostPath:
+            path: /usr
+        - name: config-volume
+          configMap:
+            name: security-monitoring-config
+            items:
+              - key: falco.yaml
+                path: falco.yaml
+              - key: falco_rules.local.yaml
+                path: falco_rules.local.yaml
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: falco-service
+  namespace: security
+spec:
+  selector:
+    app: falco
+  ports:
+    - protocol: TCP
+      port: 8765
+      targetPort: 8765
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: falco-network-policy
+  namespace: security
+spec:
+  podSelector:
+    matchLabels:
+      app: falco
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32  # AWS metadata
+      ports:
+        - protocol: TCP
+          port: 443  # Allow HTTPS egress
